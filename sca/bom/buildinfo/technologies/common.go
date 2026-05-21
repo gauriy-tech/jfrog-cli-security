@@ -49,6 +49,11 @@ type BuildInfoBomGeneratorParams struct {
 	InstallCommandArgs []string
 	// Curation params
 	IsCurationCmd bool
+	// OutputFormat is the --format flag value forwarded from the curation command
+	// ("json" or "table"). The default empty string is treated as "table" by all
+	// renderers. Set by curation commands only; generic audit/scan commands leave
+	// this empty and are unaffected.
+	OutputFormat string
 	// Java params
 	IsMavenDepTreeInstalled bool
 	UseWrapper              bool
@@ -60,6 +65,10 @@ type BuildInfoBomGeneratorParams struct {
 	NpmOverwritePackageLock bool
 	NpmRunNative            bool
 	NpmLegacyPeerDeps       bool
+	// Yarn params
+	// YarnOverwriteYarnLock refreshes yarn.lock when older than package.json (mirrors NpmOverwritePackageLock).
+	// Curation sets this to true; audit/scan leave it false to trust the existing lockfile.
+	YarnOverwriteYarnLock bool
 	// Pnpm params
 	MaxTreeDepth string
 	// Docker params
