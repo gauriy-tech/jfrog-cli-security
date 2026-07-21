@@ -718,6 +718,21 @@ func (ca *CurationAuditCommand) auditTree(tech techutils.Technology, results map
 	if err := validateRunNativeForTech(tech, ca.RunNative()); err != nil {
 		return err
 	}
+	// pnpm, Yarn, and npm (--run-native) read the Artifactory URL from .npmrc/.yarnrc.yml rather
+	// than from a jf config file. checkSupportByVersionOrEnv is not called for these techs, so
+	// PackageManagerConfig is still nil here. Call SetRepo early to validate the URL (via
+	// ParseArtifactoryNpmRegistryUrl) immediately — before the potentially expensive dependency
+	// tree calculation starts.
+	if ca.PackageManagerConfig == nil {
+		switch {
+		case tech == techutils.Pnpm,
+			tech == techutils.Yarn,
+			ca.RunNative() && tech == techutils.Npm:
+			if err := ca.SetRepo(tech); err != nil {
+				return err
+			}
+		}
+	}
 	params, err := ca.getBuildInfoParamsByTech()
 	if err != nil {
 		return errorutils.CheckErrorf("failed to get build info params for %s: %v", tech.String(), err)
@@ -1163,6 +1178,11 @@ func (ca *CurationAuditCommand) setRepoFromNpmrc() error {
 		SetTargetRepo(registryConfig.RepoName).
 		SetServerDetails(serverDetails)
 	ca.setPackageManagerConfig(repoConfig)
+	// Populate depsRepo on the audit-params interface so getBuildInfoParamsByTech returns the
+	// correct repository name. For --run-native the user never passes --deps-repo, so ca.DepsRepo()
+	// would otherwise be "" and configNpmResolutionServerIfNeeded would skip routing the internal
+	// 'npm install' through the curation-audit passthrough endpoint.
+	ca.SetDepsRepo(registryConfig.RepoName)
 	log.Info(fmt.Sprintf("--run-native: using Artifactory URL %q and repository %q from .npmrc", registryConfig.ArtifactoryUrl, registryConfig.RepoName))
 	return nil
 }

@@ -206,8 +206,14 @@ func GetNativePnpmRegistryConfig() (*npm.NpmrcRegistryConfig, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to locate pnpm executable: %w", err)
 	}
+	return getPnpmRegistryConfigInDir(pnpmExecPath, "")
+}
 
-	registryData, err := getPnpmCmd(pnpmExecPath, "", "config", "get", "registry").RunWithOutput()
+// getPnpmRegistryConfigInDir is GetNativePnpmRegistryConfig scoped to an arbitrary directory
+// (rather than the process's working directory), so callers can read the .npmrc of a temp
+// copy of the project (e.g. the curation lockfile-regeneration dir) instead of the real one.
+func getPnpmRegistryConfigInDir(pnpmExecPath, workingDir string) (*npm.NpmrcRegistryConfig, error) {
+	registryData, err := getPnpmCmd(pnpmExecPath, workingDir, "config", "get", "registry").RunWithOutput()
 	if err != nil {
 		return nil, fmt.Errorf("failed to read registry from pnpm config: %w", err)
 	}
@@ -223,7 +229,7 @@ func GetNativePnpmRegistryConfig() (*npm.NpmrcRegistryConfig, error) {
 		return nil, err
 	}
 
-	tokenData, tokenErr := getPnpmCmd(pnpmExecPath, "", "config", "get", authKey).RunWithOutput()
+	tokenData, tokenErr := getPnpmCmd(pnpmExecPath, workingDir, "config", "get", authKey).RunWithOutput()
 	authToken := ""
 	if tokenErr == nil {
 		authToken = strings.TrimSpace(string(tokenData))
@@ -239,7 +245,35 @@ func GetNativePnpmRegistryConfig() (*npm.NpmrcRegistryConfig, error) {
 	}, nil
 }
 
-const supportedPnpmMajorVersion = 10
+// routeCurationInstallThroughPassthrough rewrites tmpDir's copied .npmrc registry (and its
+// matching auth token entry, if any) to route through the curation-audit passthrough endpoint
+// (see npm.CurationAuditPassthroughBaseUrl), so the 'pnpm install --lockfile-only' below doesn't
+// 403 when Artifactory blocks the plain npm metadata API. tmpDir is a throwaway copy of the
+// project (see copyProjectToDir); unlike npm's native-mode override there is nothing to restore
+// — the whole directory is removed once the lockfile has been extracted.
+func routeCurationInstallThroughPassthrough(pnpmExecPath, tmpDir string) error {
+	registryConfig, err := getPnpmRegistryConfigInDir(pnpmExecPath, tmpDir)
+	if err != nil {
+		return fmt.Errorf("failed to read Artifactory details from .npmrc for curation passthrough: %w", err)
+	}
+	newRegistry := npm.CurationAuditPassthroughBaseUrl(registryConfig.ArtifactoryUrl) + "api/npm/" + registryConfig.RepoName + "/"
+	if _, err = getPnpmCmd(pnpmExecPath, tmpDir, "config", "set", "registry", newRegistry, "--location=project").RunWithOutput(); err != nil {
+		return fmt.Errorf("failed to set curation passthrough registry: %w", err)
+	}
+	if registryConfig.AuthToken == "" {
+		return nil
+	}
+	newAuthKey, err := npm.BuildNpmAuthTokenKey(newRegistry)
+	if err != nil {
+		return err
+	}
+	if _, err = getPnpmCmd(pnpmExecPath, tmpDir, "config", "set", newAuthKey, registryConfig.AuthToken, "--location=project").RunWithOutput(); err != nil {
+		return fmt.Errorf("failed to set curation passthrough auth token: %w", err)
+	}
+	return nil
+}
+
+const minSupportedPnpmMajorVersion = 10
 
 // getPnpmExecPath locates the pnpm executable and returns it together with its version,
 // so callers needing the version (e.g. the curation version check) need not re-spawn it.
@@ -263,8 +297,8 @@ func getPnpmExecPath() (pnpmExecPath, pnpmVersion string, err error) {
 }
 
 // validateSupportedPnpmVersion returns an error unless the installed pnpm major
-// version is exactly supportedPnpmMajorVersion. Curation supports only that major,
-// so both older and newer majors are rejected.
+// version is at least minSupportedPnpmMajorVersion. Curation supports that major
+// and newer (10.x, 11.x, ...); only older majors are rejected.
 func validateSupportedPnpmVersion(versionStr string) error {
 	// Version string may include extra lines (warnings on incompatible Node); take first token.
 	firstLine := strings.SplitN(versionStr, "\n", 2)[0]
@@ -273,8 +307,8 @@ func validateSupportedPnpmVersion(versionStr string) error {
 	if err != nil {
 		return fmt.Errorf("could not parse pnpm version %q: %w", versionStr, err)
 	}
-	if major != supportedPnpmMajorVersion {
-		return fmt.Errorf("resolving pnpm dependencies from Artifactory is currently not supported for pnpm versions other than %d.x. The current pnpm version is: %s", supportedPnpmMajorVersion, versionStr)
+	if major < minSupportedPnpmMajorVersion {
+		return fmt.Errorf("resolving pnpm dependencies from Artifactory is currently not supported for pnpm versions older than %d.x. The current pnpm version is: %s", minSupportedPnpmMajorVersion, versionStr)
 	}
 	return nil
 }
@@ -406,6 +440,10 @@ func resolveLockfileDir(pnpmExecPath, workingDir string) (lockfileDir string, cl
 	}()
 
 	if err = copyProjectToDir(workingDir, tmpDir); err != nil {
+		return "", cleanup, err
+	}
+
+	if err = routeCurationInstallThroughPassthrough(pnpmExecPath, tmpDir); err != nil {
 		return "", cleanup, err
 	}
 

@@ -78,13 +78,37 @@ func BuildDependencyTree(params technologies.BuildInfoBomGeneratorParams) (depen
 	return
 }
 
+// CurationAuditPassthroughBaseUrl rewrites a plain Artifactory base URL (e.g. "https://host/artifactory/")
+// to route through the curation-audit passthrough endpoint (".../artifactory/api/curation/audit/"),
+// matching what Maven, Gradle, and NuGet already do for their own native tools. The npm/pnpm client
+// then appends its normal "api/npm/<repo>/..." suffix on top, landing on
+// ".../artifactory/api/curation/audit/api/npm/<repo>/...". The CVS backend recognizes requests on this
+// path and, in passthrough mode, blocks only malicious packages at the metadata layer — full curation
+// policy enforcement still happens via curation-audit's own per-package check against the plain endpoint.
+func CurationAuditPassthroughBaseUrl(artifactoryUrl string) string {
+	return strings.TrimSuffix(artifactoryUrl, "/") + "/api/curation/audit/"
+}
+
 // Generates a .npmrc file to configure an Artifactory server as the resolver server.
-// Skipped when NpmRunNative is set — the project's existing .npmrc is used as-is for dependency resolution.
+// For curation-audit, the registry is rewritten to route through the curation-audit passthrough
+// endpoint (see CurationAuditPassthroughBaseUrl) — including when NpmRunNative is set, so the
+// internal 'npm install' used to resolve the dependency tree doesn't 403 when Artifactory blocks the
+// plain npm metadata API. Non-curation callers (jf audit/scan) are unaffected and, when NpmRunNative
+// is set, keep using the project's existing .npmrc as-is.
 func configNpmResolutionServerIfNeeded(params *technologies.BuildInfoBomGeneratorParams) (clearResolutionServerFunc func() error, err error) {
-	if params.DependenciesRepository == "" || params.NpmRunNative {
+	if params.DependenciesRepository == "" {
 		return
 	}
-	clearResolutionServerFunc, err = npm.SetArtifactoryAsResolutionServer(params.ServerDetails, params.DependenciesRepository)
+	if params.NpmRunNative && !params.IsCurationCmd {
+		return
+	}
+	serverDetails := params.ServerDetails
+	if params.IsCurationCmd {
+		curatedServerDetails := *serverDetails
+		curatedServerDetails.ArtifactoryUrl = CurationAuditPassthroughBaseUrl(curatedServerDetails.ArtifactoryUrl)
+		serverDetails = &curatedServerDetails
+	}
+	clearResolutionServerFunc, err = npm.SetArtifactoryAsResolutionServer(serverDetails, params.DependenciesRepository)
 	return
 }
 
